@@ -1,0 +1,1 @@
+# Allcrack-package-manager
