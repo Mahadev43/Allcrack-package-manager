@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# AllCrack Package Manager (ac) - a clean command interface over pacman.
+
+set -u
+
+readonly AC_NAME="AllCrack Package Manager"
+readonly AC_VERSION="0.1.0"
+readonly AC_SHORT_VERSION="0.1"
+
+err() { printf 'Error: %s\n' "$*" >&2; }
+
+usage() {
+    cat <<EOF
+$AC_NAME v$AC_SHORT_VERSION
+
+Usage:
+  ac <command> [arguments]
+
+Commands:
+
+  install <package>...   Install packages
+  remove <package>...    Remove packages
+  update                 Update repositories
+  upgrade                Upgrade installed packages
+  help                   Show this help
+EOF
+}
+
+require_pacman() {
+    if ! command -v pacman >/dev/null 2>&1; then
+        err "pacman not found. ac requires an Arch-based system."
+        exit 127
+    fi
+}
+
+require_root() {
+    if [ "$EUID" -ne 0 ]; then
+        err "permission denied. Run with sudo: sudo ac $*"
+        exit 1
+    fi
+}
+
+# Run pacman, keep its exit status, and report failures in ac's own voice.
+run_pacman() {
+    local failmsg=$1
+    shift
+    pacman "$@"
+    local rc=$?
+    if [ "$rc" -ne 0 ]; then
+        printf 'ac: %s\n' "$failmsg" >&2
+        exit "$rc"
+    fi
+}
+
+cmd_install() {
+    if [ "$#" -eq 0 ]; then
+        err "package name required."
+        printf '\nUsage:\n  ac install <package>...\n' >&2
+        exit 2
+    fi
+    require_pacman
+    require_root install "$@"
+    printf '%s v%s\n\n→ Installing: %s\n\n' "$AC_NAME" "$AC_SHORT_VERSION" "$*"
+    run_pacman "package installation failed." -S --needed "$@"
+}
+
+cmd_remove() {
+    if [ "$#" -eq 0 ]; then
+        err "package name required."
+        printf '\nUsage:\n  ac remove <package>...\n' >&2
+        exit 2
+    fi
+    require_pacman
+    require_root remove "$@"
+    printf '%s v%s\n\n→ Removing: %s\n\n' "$AC_NAME" "$AC_SHORT_VERSION" "$*"
+    run_pacman "package removal failed." -R "$@"
+}
+
+cmd_update() {
+    require_pacman
+    require_root update
+    printf '%s v%s\n\n→ Updating repositories\n\n' "$AC_NAME" "$AC_SHORT_VERSION"
+    run_pacman "repository update failed." -Sy
+    printf '\nNote: run "sudo ac upgrade" before installing new packages.\n'
+    printf 'Installing on a refreshed but not upgraded system can break Arch.\n'
+}
+
+cmd_upgrade() {
+    require_pacman
+    require_root upgrade
+    printf '%s v%s\n\n→ Upgrading system\n\n' "$AC_NAME" "$AC_SHORT_VERSION"
+    # -Syu refreshes and upgrades together, avoiding partial upgrades.
+    run_pacman "system upgrade failed." -Syu
+}
+
+main() {
+    if [ "$#" -eq 0 ]; then
+        usage
+        exit 0
+    fi
+
+    local cmd=$1
+    shift
+
+    case "$cmd" in
+        install)             cmd_install "$@" ;;
+        remove)              cmd_remove "$@" ;;
+        update)              cmd_update ;;
+        upgrade)             cmd_upgrade ;;
+        help|-h|--help)      usage ;;
+        --version|-v|version) printf '%s v%s\n' "$AC_NAME" "$AC_VERSION" ;;
+        *)
+            err "unknown command '$cmd'."
+            printf "\nRun 'ac help' for usage.\n" >&2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
