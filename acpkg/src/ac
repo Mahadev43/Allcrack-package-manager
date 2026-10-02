@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# AllCrack Package Manager (ac) - entry point.
+#
+# ac is a command-line frontend for pacman. This file only locates and loads
+# the modules in lib/ and hands control to the CLI layer (lib/cli.sh).
+#
+# Environment (mainly for development and tests):
+#   AC_LIB_DIR  Directory holding the modules (default: lib/ next to this file).
+#   AC_PACMAN   Path of the pacman binary to use (default: pacman from PATH).
+
+set -u
+
+# lib/ relies on associative arrays and `declare -g`, which need bash >= 4.4
+# (older versions also mishandle empty arrays under `set -u`).
+if [ -z "${BASH_VERSINFO[0]:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ] ||
+    { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 4 ]; }; then
+    echo "ac: bash 4.4 or newer is required." >&2
+    exit 1
+fi
+
+# Finds the directory that contains this script, following symlinks so that a
+# link such as /usr/local/bin/ac -> /usr/local/lib/ac/ac still finds lib/.
+# Arguments: none.
+# Returns: prints the absolute directory path on stdout.
+ac_script_dir() {
+    local self=${BASH_SOURCE[0]} resolved
+    resolved=$(readlink -f -- "$self" 2>/dev/null) || resolved=$self
+    (cd -- "$(dirname -- "$resolved")" && pwd)
+}
+
+# Sources every module ac needs, in dependency order. Exits with status 1 if a
+# module is missing (usually a broken installation).
+# Arguments:
+#   $1 - Directory containing the module files.
+# Returns: nothing; defines the functions and constants of all modules.
+ac_load_modules() {
+    local libdir=$1 module
+    for module in version errors output pacman cli \
+        commands/install commands/remove commands/search commands/info \
+        commands/list commands/update commands/upgrade; do
+        if [ ! -r "$libdir/$module.sh" ]; then
+            echo "ac: missing module '$libdir/$module.sh'. Is ac installed correctly?" >&2
+            exit 1
+        fi
+        # shellcheck source=/dev/null
+        . "$libdir/$module.sh"
+    done
+}
+
+# Program entry: loads modules, installs the cleanup and interrupt handlers
+# and runs the CLI.
+# Arguments:
+#   $@ - The command line given to ac.
+# Returns: the exit status of the requested command.
+ac_main() {
+    local libdir=${AC_LIB_DIR:-"$(ac_script_dir)/lib"}
+    ac_load_modules "$libdir"
+    trap ac_cleanup EXIT
+    trap ac_on_interrupt INT TERM
+    cli_main "$@"
+}
+
+ac_main "$@"
+exit $?
