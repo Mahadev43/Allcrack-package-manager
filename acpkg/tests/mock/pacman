@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+# Fake pacman for the ac test-suite. It emulates the small part of pacman's
+# command-line behaviour and output format that ac uses (-Ss -Qs -Si -Qi -Q
+# -Qq -Qg -S -R -Syu -Sy) against a tiny in-memory repository, so the suite
+# runs on any machine, not just Arch.
+#
+# Environment:
+#   MOCK_STATE  Directory with the fake state: `installed` ("name version" per
+#               line) and `calls.log` (every invocation is appended there).
+#   MOCK_FAIL   Failure to inject into -S/-R/-Syu/-Sy: network, lock,
+#               interrupted, signal, generic.
+#   MOCK_DEP_BLOCK  When 1, -R fails with a dependency error.
+#   MOCK_QUERY_FAIL Failure to inject into read-only queries: sync (-Ss/-Si),
+#               local (-Q*), other (every query), perm (permission denied).
+#   MOCK_EMPTY_SYNC When 1, -Ss finds nothing and warns that the sync
+#               databases do not exist (like a never-synchronized system).
+#   MOCK_SLOW   warn (pause 2s after a warning) or hang (wait until
+#               interrupted) inside -S, to test live stderr and Ctrl+C.
+
+set -u
+STATE=${MOCK_STATE:?MOCK_STATE must be set}
+LOG="$STATE/calls.log"
+INSTALLED="$STATE/installed"
+
+# Prints the fake repository: repo|name|version|arch|description|depends|size.
+# Arguments: none.
+# Returns: 0.
+mock_db() {
+    cat <<'DB'
+extra|firefox|147.0-1|x86_64|Standalone web browser from mozilla.org|dbus-glibc ffmpeg gtk3 libpulse|263.00 MiB
+extra|chromium|130.0-1|x86_64|A web browser built for speed, simplicity, and security|gtk3 nss|290.50 MiB
+extra|git|2.47.0-1|x86_64|the fast distributed version control system|curl expat|21.10 MiB
+extra|vim|9.1.0-1|x86_64|Vi Improved, a highly configurable, improved version of the vi text editor|glibc gpm|3.80 MiB
+extra|docker|27.3.1-1|x86_64|Pack, ship and run any application as a lightweight container|containerd iptables|110.00 MiB
+extra|docker-compose|2.29.7-1|x86_64|Define and run multi-container applications with Docker|docker|30.10 MiB
+core|bash|5.2.037-1|x86_64|The GNU Bourne Again shell|glibc readline|9.30 MiB
+core|glibc|2.40-1|x86_64|GNU C Library|linux-api-headers|50.00 MiB
+DB
+}
+
+# Prints the fake-repository row for a package.
+# Arguments:
+#   $1 - Package name or "repo/name".
+# Returns: 0 and prints the row if found, 1 otherwise.
+mock_row() {
+    local want=${1##*/} row
+    row=$(mock_db | awk -F'|' -v n="$want" '$2 == n {print; exit}')
+    [ -n "$row" ] && printf '%s\n' "$row"
+}
+
+# Prints the installed version of a package.
+# Arguments:
+#   $1 - Package name.
+# Returns: 0 and prints the version if installed, 1 otherwise.
+mock_installed_ver() {
+    awk -v n="$1" '$1 == n {print $2; found = 1} END {exit !found}' "$INSTALLED"
+}
+
+# Prints a pacman-style info block (-Si or -Qi) for a package.
+# Arguments:
+#   $1 - "sync" or "local".
+#   $2 - Package name or "repo/name".
+# Returns: 0 if found, 1 (with pacman's error text on stderr) otherwise.
+mock_info() {
+    local kind=$1 target=$2 row repo name ver arch desc deps size
+    if [ "$kind" = local ]; then
+        if ! mock_installed_ver "${target##*/}" >/dev/null; then
+            echo "error: package '$target' was not found" >&2
+            return 1
+        fi
+        row=$(mock_row "$target") || row="|${target##*/}|$(mock_installed_ver "${target##*/}")|x86_64|Local-only test package|None|1.00 MiB"
+    else
+        row=$(mock_row "$target") || { echo "error: package '$target' was not found" >&2; return 1; }
+    fi
+    IFS='|' read -r repo name ver arch desc deps size <<<"$row"
+    if [ "$kind" = sync ]; then
+        printf '%-15s : %s\n' Repository "$repo"
+    fi
+    printf '%-15s : %s\n' Name "$name" Version "$ver" Description "$desc" Architecture "$arch"
+    printf '%-15s : %s\n' "Depends On" "${deps// /  }"
+    printf '%-15s : %s\n' "Optional Deps" "none-test: first optional dep"
+    printf '%-15s   %s\n' "" "other-test: continuation line"
+    printf '%-15s : %s\n' "Installed Size" "$size"
+}
+
+# Prints a pacman-style search listing.
+# Arguments:
+#   $1 - "sync" (all repository packages) or "local" (installed only).
+#   $2... - Search terms; a package must match all of them.
+# Returns: 0 if anything matched, 1 otherwise; an invalid regex prints an
+#   error and returns 1.
+mock_search() {
+    local kind=$1 term row repo name ver desc ok hits=0 inst
+    shift
+    for term in "$@"; do
+        grep -E -e "$term" </dev/null >/dev/null 2>&1
+        if [ $? -eq 2 ]; then
+            echo "error: invalid regular expression '$term'" >&2
+            return 1
+        fi
+    done
+    while IFS='|' read -r repo name ver _ desc _; do
+        ok=1
+        for term in "$@"; do
+            printf '%s %s\n' "$name" "$desc" | grep -qiE -e "$term" || ok=0
+        done
+        [ "$ok" -eq 1 ] || continue
+        inst=""
+        mock_installed_ver "$name" >/dev/null && inst=" [installed]"
+        if [ "$kind" = local ]; then
+            [ -n "$inst" ] || continue
+            printf 'local/%s %s\n    %s\n' "$name" "$(mock_installed_ver "$name")" "$desc"
+        else
+            printf '%s/%s %s%s\n    %s\n' "$repo" "$name" "$ver" "$inst" "$desc"
+        fi
+        hits=1
+    done < <(mock_db)
+    if [ "$kind" = local ]; then
+        # Local-only packages are not in the repository listing above.
+        while read -r name ver; do
+            mock_row "$name" >/dev/null && continue
+            printf '%s\n' "$name" | grep -qiE -e "${1:-.}" || continue
+            printf 'local/%s %s\n    Local-only test package\n' "$name" "$ver"
+            hits=1
+        done <"$INSTALLED"
+    fi
+    [ "$hits" -eq 1 ]
+}
+
+# Injects the failure requested through MOCK_FAIL, if any.
+# Arguments: none.
+# Returns: does not return when a failure is injected (exits non-zero);
+#   returns 0 when no failure is requested.
+mock_maybe_fail() {
+    case "${MOCK_FAIL:-}" in
+        network)
+            echo "error: failed retrieving file 'core.db' from mirror.example : Could not resolve host: mirror.example" >&2
+            echo "error: failed to synchronize all databases (download library error)" >&2
+            exit 1 ;;
+        lock)
+            echo "error: failed to init transaction (unable to lock database)" >&2
+            echo "error: could not lock database: File exists" >&2
+            exit 1 ;;
+        interrupted)
+            echo "error: failed to commit transaction (transaction interrupted)" >&2
+            exit 1 ;;
+        signal)
+            exit 130 ;;
+        generic)
+            echo "error: failed to commit transaction (conflicting files)" >&2
+            exit 1 ;;
+        deps)
+            echo "error: failed to prepare transaction (could not satisfy dependencies)" >&2
+            echo ":: unable to satisfy dependency 'libfoo' required by firefox" >&2
+            exit 1 ;;
+        conflict)
+            echo "error: unresolvable package conflicts detected" >&2
+            echo "error: failed to prepare transaction (conflicting dependencies)" >&2
+            echo ":: chromium and firefox are in conflict" >&2
+            exit 1 ;;
+        unknown)
+            echo "error: config file /etc/pacman.conf could not be read: No such file or directory" >&2
+            exit 1 ;;
+    esac
+    return 0
+}
+
+# Simulates a slow transaction according to MOCK_SLOW: "warn" prints a
+# warning, pauses 2 seconds and then continues; "hang" prints a warning and
+# waits until interrupted, then prints pacman's "transaction interrupted"
+# error and exits 1 (as pacman does on Ctrl+C).
+# Arguments: none.
+# Returns: 0 (or exits 1 when interrupted in "hang" mode).
+mock_maybe_slow() {
+    local sp
+    case "${MOCK_SLOW:-}" in
+        warn)
+            echo "warning: early warning from the transaction" >&2
+            sleep 2 ;;
+        hang)
+            echo "warning: early warning from the transaction" >&2
+            sleep 30 &
+            sp=$!
+            trap 'kill "$sp" 2>/dev/null; echo "error: failed to commit transaction (transaction interrupted)" >&2; exit 1' INT TERM
+            wait "$sp" ;;
+    esac
+    return 0
+}
+
+# Injects the query failure requested through MOCK_QUERY_FAIL, if it applies
+# to the kind of database being queried. Messages follow pacman's format.
+# Arguments:
+#   $1 - "sync" or "local": which database the current operation reads.
+# Returns: 0 when no failure applies; 1 (after printing pacman-style errors
+#   on stderr) when a failure is injected.
+mock_query_gate() {
+    local kind=$1
+    case "${MOCK_QUERY_FAIL:-}" in
+        sync)
+            [ "$kind" = sync ] || return 0
+            echo "error: could not register 'core' database (database is incorrect version)" >&2 ;;
+        local)
+            [ "$kind" = local ] || return 0
+            echo "error: failed to initialize alpm library" >&2
+            echo "  (could not find or read directory)" >&2 ;;
+        other)
+            echo "error: config file /etc/pacman.conf could not be read: No such file or directory" >&2 ;;
+        perm)
+            echo "error: failed to initialize alpm library" >&2
+            echo "  (could not open file /var/lib/pacman/local/ALPM_DB_VERSION: Permission denied)" >&2 ;;
+        *)
+            return 0 ;;
+    esac
+    return 1
+}
+
+# Emulates `pacman -S`: installs every target or fails without changes if any
+# target is unknown.
+# Arguments:
+#   $@ - Target package names.
+# Returns: 0 on success, 1 on failure.
+mock_install() {
+    local t bad=0 row
+    mock_maybe_fail
+    mock_maybe_slow
+    for t in "$@"; do
+        mock_row "$t" >/dev/null || { echo "error: target not found: $t" >&2; bad=1; }
+    done
+    [ "$bad" -eq 0 ] || return 1
+    for t in "$@"; do
+        row=$(mock_row "$t")
+        mock_installed_ver "${t##*/}" >/dev/null && continue
+        printf '%s %s\n' "${t##*/}" "$(cut -d'|' -f3 <<<"$row")" >>"$INSTALLED"
+        echo ":: installing ${t##*/}"
+    done
+}
+
+# Emulates `pacman -R`: removes every target or fails without changes if any
+# target is not installed (or MOCK_DEP_BLOCK=1).
+# Arguments:
+#   $@ - Target package names.
+# Returns: 0 on success, 1 on failure.
+mock_remove() {
+    local t bad=0
+    mock_maybe_fail
+    for t in "$@"; do
+        mock_installed_ver "$t" >/dev/null || { echo "error: target not found: $t" >&2; bad=1; }
+    done
+    [ "$bad" -eq 0 ] || return 1
+    if [ "${MOCK_DEP_BLOCK:-0}" = 1 ]; then
+        echo "error: failed to prepare transaction (could not satisfy dependencies)" >&2
+        echo ":: foo: removing $1 breaks dependency '$1'" >&2
+        return 1
+    fi
+    for t in "$@"; do
+        grep -v "^$t " "$INSTALLED" >"$INSTALLED.tmp"
+        mv "$INSTALLED.tmp" "$INSTALLED"
+        echo ":: removing $t"
+    done
+}
+
+# Entry point of the fake pacman: logs the call and dispatches on the operation.
+# Arguments:
+#   $@ - The arguments ac passed to pacman.
+# Returns: the emulated pacman exit status.
+mock_main() {
+    local op=${1:-} a past=0 t
+    local -a targets=()
+    printf '%s\n' "$*" >>"$LOG"
+    shift
+    for a in "$@"; do
+        if [ "$past" -eq 0 ] && [ "$a" = -- ]; then
+            past=1
+        elif [ "$past" -eq 0 ] && [[ $a == -* ]]; then
+            :
+        else
+            targets+=("$a")
+        fi
+    done
+    case "$op" in
+        -Ss | -Si) mock_query_gate sync || return 1 ;;
+        -Qs | -Qi | -Q | -Qq | -Qg | -Qgq) mock_query_gate local || return 1 ;;
+    esac
+    if [ "$op" = -Ss ] && [ "${MOCK_EMPTY_SYNC:-0}" = 1 ]; then
+        echo "warning: database file for 'core' does not exist (use '-Sy' to download)" >&2
+        return 1
+    fi
+    case "$op" in
+        -Ss) mock_search sync "${targets[@]}" ;;
+        -Qs) mock_search local "${targets[@]}" ;;
+        -Si)
+            for t in "${targets[@]}"; do mock_info sync "$t" || return 1; done ;;
+        -Qi)
+            for t in "${targets[@]}"; do mock_info local "$t" || return 1; done ;;
+        -Q | -Qq)
+            if [ "${#targets[@]}" -eq 0 ]; then
+                if [ "$op" = -Qq ]; then cut -d' ' -f1 "$INSTALLED"; else cat "$INSTALLED"; fi
+            else
+                for t in "${targets[@]}"; do
+                    mock_installed_ver "$t" >/dev/null || { echo "error: package '$t' was not found" >&2; return 1; }
+                    if [ "$op" = -Qq ]; then echo "$t"; else echo "$t $(mock_installed_ver "$t")"; fi
+                done
+            fi ;;
+        -Qg | -Qgq)
+            echo "error: group '${targets[0]:-}' was not found" >&2
+            return 1 ;;
+        -S) mock_install "${targets[@]}" ;;
+        -R) mock_remove "${targets[@]}" ;;
+        -Syu | -Sy)
+            mock_maybe_fail
+            echo ":: Synchronizing package databases..."
+            echo " there is nothing to do" ;;
+        *) echo "error: mock pacman: unsupported operation '$op'" >&2; return 1 ;;
+    esac
+}
+
+mock_main "$@"
