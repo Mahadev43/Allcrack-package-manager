@@ -4,13 +4,14 @@
 # Removes one or more installed packages. Every name is checked first so a
 # typo produces a clean "not installed" error before pacman starts; pacman
 # still decides which dependencies may be removed (ac adds no removal logic).
+# Honors --yes / confirm=false through AC_AUTO_YES.
 # Arguments:
 #   $@ - Names of the packages to remove (validated by the CLI layer).
 # Returns: EX_NOT_FOUND if any name is not installed (nothing is removed);
-#   otherwise the code from pm_transaction.
+#   otherwise the code from pm_remove.
 # Side effects: removes packages; requires root.
 cmd_remove() {
-    local pkg
+    local pkg rc
     local -a missing=()
 
     pm_require_root remove "$@"
@@ -21,11 +22,18 @@ cmd_remove() {
         fi
     done
     if [ "${#missing[@]}" -gt 0 ]; then
-        err_plain "Package not installed: $(out_join "${missing[@]}")"
+        err_raise not-installed "$EX_NOT_FOUND" "Package not installed: $(out_join "${missing[@]}")"
         return "$EX_NOT_FOUND"
     fi
 
     out_banner
     out_list_block "Removing:" "$@"
-    pm_transaction remove "package removal" -R -- "$@"
+    pm_remove "$@"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        out_success "Removed: $(out_join "$@")"
+    else
+        out_failure "Failed: $(out_join "$@")"
+    fi
+    return "$rc"
 }

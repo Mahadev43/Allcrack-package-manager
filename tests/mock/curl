@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Fake curl for the ac test-suite: records its arguments in
+# $MOCK_STATE/curl.log and fails like a DNS error when MOCK_NET=fail.
+
+set -u
+STATE=${MOCK_STATE:?MOCK_STATE must be set}
+
+# Entry point: logs the call and succeeds or fails according to MOCK_NET.
+# Arguments:
+#   $@ - Arguments ac passed to curl.
+# Returns: 0, or 6 when MOCK_NET=fail.
+curl_main() {
+    printf '%s\n' "$*" >>"$STATE/curl.log"
+    if [ "${MOCK_NET:-ok}" = fail ]; then
+        echo "curl: (6) Could not resolve host: mirror.example" >&2
+        return 6
+    fi
+    echo "HTTP/2 200"
+}
+
+curl_main "$@"

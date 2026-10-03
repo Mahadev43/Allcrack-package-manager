@@ -35,9 +35,11 @@ ac_script_dir() {
 # Returns: nothing; defines the functions and constants of all modules.
 ac_load_modules() {
     local libdir=$1 module
-    for module in version errors output pacman cli \
-        commands/install commands/remove commands/search commands/info \
-        commands/list commands/update commands/upgrade; do
+    for module in version globals json errors output config pacman cli \
+        commands/install commands/remove commands/reinstall commands/search \
+        commands/info commands/status commands/list commands/orphan \
+        commands/clean commands/history commands/doctor \
+        commands/update commands/upgrade; do
         if [ ! -r "$libdir/$module.sh" ]; then
             echo "ac: missing module '$libdir/$module.sh'. Is ac installed correctly?" >&2
             exit 1

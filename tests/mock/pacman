@@ -15,7 +15,10 @@
 #   MOCK_EMPTY_SYNC When 1, -Ss finds nothing and warns that the sync
 #               databases do not exist (like a never-synchronized system).
 #   MOCK_SLOW   warn (pause 2s after a warning) or hang (wait until
-#               interrupted) inside -S, to test live stderr and Ctrl+C.
+#               interrupted) inside -S/-Syu, to test live stderr and Ctrl+C.
+#   $MOCK_STATE/orphans  Names reported by -Qdtq (only while still installed).
+#   $MOCK_STATE/upgrades Lines "name old -> new" reported by -Qu (installed only).
+#   MOCK_VERSION  When "bad", --version prints text without a libalpm version.
 
 set -u
 STATE=${MOCK_STATE:?MOCK_STATE must be set}
@@ -35,7 +38,10 @@ extra|docker|27.3.1-1|x86_64|Pack, ship and run any application as a lightweight
 extra|docker-compose|2.29.7-1|x86_64|Define and run multi-container applications with Docker|docker|30.10 MiB
 core|bash|5.2.037-1|x86_64|The GNU Bourne Again shell|glibc readline|9.30 MiB
 core|glibc|2.40-1|x86_64|GNU C Library|linux-api-headers|50.00 MiB
+core|pacman|7.0.0-1|x86_64|A library-based package manager with dependency support|glibc curl|4.50 MiB
 DB
+    # A package whose description carries terminal escape sequences.
+    printf 'extra|evilpkg|1.0-1|x86_64|Evil \033[31mred\033[0m description|None|1.00 MiB\n'
 }
 
 # Prints the fake-repository row for a package.
@@ -77,9 +83,15 @@ mock_info() {
         printf '%-15s : %s\n' Repository "$repo"
     fi
     printf '%-15s : %s\n' Name "$name" Version "$ver" Description "$desc" Architecture "$arch"
+    if [ -n "$repo" ]; then
+        printf '%-15s : %s\n' URL "https://example.org/$name" Licenses "MPL-2.0  GPL-2.0-or-later"
+    fi
     printf '%-15s : %s\n' "Depends On" "${deps// /  }"
     printf '%-15s : %s\n' "Optional Deps" "none-test: first optional dep"
     printf '%-15s   %s\n' "" "other-test: continuation line"
+    if [ "$kind" = sync ]; then
+        printf '%-15s : %s\n' "Download Size" "80.00 MiB"
+    fi
     printf '%-15s : %s\n' "Installed Size" "$size"
 }
 
@@ -215,21 +227,24 @@ mock_query_gate() {
 }
 
 # Emulates `pacman -S`: installs every target or fails without changes if any
-# target is unknown.
+# target is unknown. Installed targets are skipped with --needed and
+# reinstalled otherwise.
 # Arguments:
-#   $@ - Target package names.
+#   $@ - Target package names (uses the global NEEDED flag).
 # Returns: 0 on success, 1 on failure.
 mock_install() {
     local t bad=0 row
     mock_maybe_fail
-    mock_maybe_slow
     for t in "$@"; do
         mock_row "$t" >/dev/null || { echo "error: target not found: $t" >&2; bad=1; }
     done
     [ "$bad" -eq 0 ] || return 1
     for t in "$@"; do
         row=$(mock_row "$t")
-        mock_installed_ver "${t##*/}" >/dev/null && continue
+        if mock_installed_ver "${t##*/}" >/dev/null; then
+            [ "$NEEDED" -eq 1 ] || echo ":: reinstalling ${t##*/}"
+            continue
+        fi
         printf '%s %s\n' "${t##*/}" "$(cut -d'|' -f3 <<<"$row")" >>"$INSTALLED"
         echo ":: installing ${t##*/}"
     done
@@ -264,25 +279,35 @@ mock_remove() {
 #   $@ - The arguments ac passed to pacman.
 # Returns: the emulated pacman exit status.
 mock_main() {
-    local op=${1:-} a past=0 t
+    local op=${1:-} a past=0 t flags=""
     local -a targets=()
+    NEEDED=0
     printf '%s\n' "$*" >>"$LOG"
     shift
     for a in "$@"; do
         if [ "$past" -eq 0 ] && [ "$a" = -- ]; then
             past=1
         elif [ "$past" -eq 0 ] && [[ $a == -* ]]; then
-            :
+            flags+=" $a"
+            [ "$a" = --needed ] && NEEDED=1
         else
             targets+=("$a")
         fi
     done
     case "$op" in
+        -S | -R | -Rs | -Ss | -Syu | -Sc | -Scc) mock_maybe_slow ;;
+    esac
+    case "$op" in
         -Ss | -Si) mock_query_gate sync || return 1 ;;
-        -Qs | -Qi | -Q | -Qq | -Qg | -Qgq) mock_query_gate local || return 1 ;;
+        -Qs | -Qi | -Q | -Qq | -Qg | -Qgq | -Qdtq | -Qu) mock_query_gate local || return 1 ;;
     esac
     if [ "$op" = -Ss ] && [ "${MOCK_EMPTY_SYNC:-0}" = 1 ]; then
         echo "warning: database file for 'core' does not exist (use '-Sy' to download)" >&2
+        return 1
+    fi
+    if [ "$op" = -Si ] && [ "${MOCK_EMPTY_SYNC:-0}" = 1 ]; then
+        echo "warning: database file for 'core' does not exist (use '-Sy' to download)" >&2
+        echo "error: package '${targets[0]:-}' was not found" >&2
         return 1
     fi
     case "$op" in
@@ -305,7 +330,33 @@ mock_main() {
             echo "error: group '${targets[0]:-}' was not found" >&2
             return 1 ;;
         -S) mock_install "${targets[@]}" ;;
-        -R) mock_remove "${targets[@]}" ;;
+        -R | -Rs) mock_remove "${targets[@]}" ;;
+        --version | -V)
+            if [ "${MOCK_VERSION:-}" = bad ]; then
+                echo "pacman: some unrecognised banner"
+            else
+                echo " .--.                  Pacman v7.0.0 - libalpm v15.0.0"
+                echo "/ _.-' .-.  .-.  .-.   Copyright (C) 2006-2024 Pacman Development Team"
+            fi ;;
+        -Qu)
+            local up=1 un uo ua unew
+            if [ -f "$STATE/upgrades" ]; then
+                while read -r un uo ua unew; do
+                    mock_installed_ver "$un" >/dev/null && { echo "$un $uo $ua $unew"; up=0; }
+                done <"$STATE/upgrades"
+            fi
+            return "$up" ;;
+        -Qdtq)
+            local found=1 n
+            if [ -f "$STATE/orphans" ]; then
+                while read -r n; do
+                    mock_installed_ver "$n" >/dev/null && { echo "$n"; found=0; }
+                done <"$STATE/orphans"
+            fi
+            return "$found" ;;
+        -Sc | -Scc)
+            mock_maybe_fail
+            echo ":: Cleaning the package cache..." ;;
         -Syu | -Sy)
             mock_maybe_fail
             echo ":: Synchronizing package databases..."

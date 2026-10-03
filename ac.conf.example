@@ -1,0 +1,19 @@
+# Example configuration for AllCrack Package Manager (ac).
+# Copy to /etc/ac.conf (system-wide) or ~/.config/ac/config (per user).
+# Every setting is optional; the values shown are the defaults.
+# Command-line options and the environment variables AC_COLOR, AC_CONFIRM and
+# AC_PROGRESS override this file; NO_COLOR disables color.
+
+# color = auto | always | never
+#   auto: colors only when writing to a terminal.
+color = auto
+
+# confirm = true | false
+#   true:  pacman asks before changing anything (default).
+#   false: auto-confirm like --yes, for install, remove, reinstall, update,
+#          upgrade and clean. Orphan removal and "clean --all" always ask.
+confirm = true
+
+# progress = true | false
+#   Show "-> doing something..." progress lines.
+progress = true

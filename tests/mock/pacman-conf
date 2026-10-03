@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Fake pacman-conf for the ac test-suite. Answers the few directives ac asks
+# for from $MOCK_STATE, and fails like pacman-conf does for a broken
+# configuration when MOCK_CONF_FAIL=1.
+
+set -u
+STATE=${MOCK_STATE:?MOCK_STATE must be set}
+
+# Entry point: prints the requested directive or the whole (fake) config.
+# Arguments:
+#   $@ - Arguments ac passed (an optional --repo=NAME and a directive name).
+# Returns: 0, or 1 when MOCK_CONF_FAIL=1.
+conf_main() {
+    local a directive=""
+    if [ "${MOCK_CONF_FAIL:-0}" = 1 ]; then
+        echo "error: config file /etc/pacman.conf, line 12: directive 'Bogus' in section 'options' not recognized." >&2
+        return 1
+    fi
+    for a in "$@"; do
+        case "$a" in
+            --repo=* | -r) ;;
+            -*) ;;
+            *) directive=$a ;;
+        esac
+    done
+    case "$directive" in
+        DBPath) echo "$STATE/db/" ;;
+        LogFile) echo "$STATE/pacman.log" ;;
+        Server) echo "https://mirror.example/core/os/x86_64" ;;
+        "") echo "[options]" ;;
+    esac
+}
+
+conf_main "$@"
